@@ -1,0 +1,88 @@
+---
+title: Deployment
+description: Deploy the detection website, these docs, and the same-origin proxy to Cloudflare Pages, or publish them as a static site on GitHub Pages.
+icon: Cloud
+---
+
+`bun run build` builds both the detection website and these docs. The website goes to `web/dist/`, and the docs are prerendered and then copied to `web/dist/docs/`. One static deployment serves the detection website at `/` and the docs at `/docs`. The detection website uses HashRouter, so it needs no page route rewrites.
+
+With the connection mode set to this site's proxy (or Auto when a direct call is not allowed), requests go through the same-origin `/api/proxy`; with [Own Worker](./worker.mdx), your Worker forwards them. Vercel, Cloudflare Pages, and the proxy Worker share `api/proxy.ts`. The local Vite server also calls `proxyRequest` from the single-file Worker `worker/main.js`:
+
+| File | Runtime |
+| --- | --- |
+| `worker/main.js` | The proxy implementation. It can also be deployed on its own as a Cloudflare Worker |
+| `api/proxy.ts` | Vercel Function, Cloudflare Pages Worker, and standalone proxy Worker |
+| `web/scripts/vite-proxy.ts` | Vite dev and preview servers |
+
+## Cloudflare Pages
+
+### Create the project [step]
+
+The Pages project uses the repository root as its root directory and deploys through the Git integration:
+
+| Setting | Value |
+| --- | --- |
+| Production branch | `main` |
+| Build command | `bun run build` |
+| Output directory | `web/dist` |
+| Environment variable | `BUN_VERSION=1.4.4` |
+
+The build compiles `api/proxy.ts` to `web/dist/_worker.js` for Cloudflare Pages advanced mode. The repository no longer needs a `functions/` directory. `wrangler.jsonc` pins the compatibility date and enables `enable_request_signal`, so a client cancellation reaches the upstream.
+
+### Check routing and caching [step]
+
+`web/public/_routes.json` sends only `/api/proxy` to the Pages Worker. The home page, hash routes, docs pages, JS/CSS, fonts, the data manifest, and the zstd chunks are all served directly by Pages static hosting. Responses from `/api/proxy` are marked `no-store`.
+
+<Callout type="warn" title="Do not turn on Cache Everything">
+  Do not add a Cache Everything rule for the whole custom domain. Otherwise it may cache API responses or hold back deployment updates. Pages comes with its own CDN and Tiered Cache. Hash-named JS/CSS and data chunks (`/assets/*`, `/data/chunks/*`, `/docs/assets/*`) are cached in the browser for one year and marked `immutable` by `web/public/_headers`. `index.html` and the data manifest keep the Pages revalidation policy. The long-lived cache depends on `web/public/404.html`: with this file, Pages answers a missing file with 404. Without it, Pages answers with `index.html` and status 200, and during a deployment switch-over that HTML is cached as a script for one year, which leaves the page blank. (On 2026-10-01 a missing `404.html` left the site blank until the Cloudflare cache was purged and the asset hashes changed.) Do not delete `404.html`.
+</Callout>
+
+### Bind the custom domain [step]
+
+First bind `lm.ikale.io` in the Pages project, then confirm that Cloudflare DNS points to the `*.pages.dev` host name of the project. Stop the automatic deployment of the old site only after the static assets on the Pages URL, the JSON/SSE relay of `/api/proxy`, and the custom domain all pass.
+
+The `/api/proxy` path of the custom domain `lm.ikale.io` is served by the [proxy Worker route](#proxy-worker-route) below. The Pages Worker serves only `*.pages.dev` and preview deployments.
+
+### Proxy Worker route [step]
+
+`wrangler.proxy.jsonc` deploys `api/proxy.ts` as the Worker `lm-fingerpoint-proxy` and binds the route `lm.ikale.io/api/proxy`. Worker routes run before Pages, so this path never reaches the Pages Worker.
+
+The custom domain does not use the Pages Worker because it treats Pages as an origin. Cloudflare replaces a 502 from the origin with its own error page, so the client never sees the upstream's error message. The custom domain also waits at most 100 seconds for the origin's response headers and then returns 524. A Worker route builds the response itself and skips this origin layer.
+
+After you change `worker/main.js`, push Pages and also run `bun run deploy:proxy` from the repository root. The API token needs account-level Workers Scripts edit permission and Workers Routes edit permission on the `ikale.io` zone.
+
+## Publish with Wrangler
+
+```sh
+bun run build:pages
+bun run preview:pages   # http://127.0.0.1:8788
+bun run deploy:pages
+```
+
+For a Direct Upload project, run `bun run build:pages:upload` and upload `web/dist/` to Pages. The regular `bun run build` also generates `_worker.js`, so both builds include the same-origin proxy. Set the compatibility date and `enable_request_signal` in the dashboard to match `wrangler.jsonc`.
+
+## Static data
+
+At build time, the reference bank, the derived bank, and the binary detector are each compressed with zstd level 19, then split into 4 MiB chunks in `web/dist/data/chunks/`. Each entry in `data/manifest.json` has `parts` and `bytes`; `bytes` is the compressed size and is used for download progress. The browser joins and decompresses the files according to the manifest. Detection loads only the data it needs. After the reference bank loads, the website downloads the detector in the background and shows the progress in the top bar. If scoring starts before the download finishes, the computing row and the detect button show that detection is waiting for the detector download. The build fails when the bank and the detector do not match. The largest static file is under the 25 MiB limit of Pages. The CLI package is still built from the redacted derived bank generated at build time and `shared_detector.bin`. It does not depend on the compressed site data.
+
+## GitHub Pages
+
+`.github/workflows/pages.yml` builds and stores the static artifact on push, and publishes it to GitHub Pages when triggered manually. Before a manual publish, enable GitHub Actions as the Pages source in the repository settings. A project site lives under `/<repository>/`, so the workflow sets `DOCS_BASE` to `/<repository>/docs`, and the docs links, the search index, and `llms.txt` all use this prefix. The workflow removes the Cloudflare-specific `_worker.js` before uploading static assets.
+
+GitHub Pages has no server functions, so this site's proxy `/api/proxy` does not exist there: with the connection mode Auto or This site's proxy, requests that need the proxy fail. For APIs that allow cross-origin browser calls, choose Direct under Connection in the API configuration to use API mode, including the tokenizer probe. For other APIs, choose [Own Worker](./worker.mdx). The `ALLOWED_ORIGINS` of the Worker must include the origin of the Pages site.
+
+## Vercel
+
+`vercel.json` runs `bun run vercel-build` and outputs `web/dist`. This command removes the Cloudflare-specific `_worker.js`. Vercel loads `api/proxy.ts` directly as the same-origin proxy, which runs for at most 300 seconds and supports cancellation.
+
+## Docs site
+
+The docs live in `docs/`. They are a React Router SPA, and every page is prerendered at build time:
+
+- The HTML and data files of each page.
+- The Markdown version of each page, `/docs/llms.mdx/<page>/content.md` (`/docs/en/llms.mdx/<page>/content.md` in English), for "Copy Markdown" and LLM tools.
+- The Open Graph image of each page, `/docs/og/<page>/image.png` (`/docs/en/og/<page>/image.png` in English).
+- The Open Graph image of the detection website's home page, `/docs/og/detector.png`, which the website's `index.html` uses as `og:image` and `twitter:image`.
+- The static search index `api/search`, plus `llms.txt` and `llms-full.txt`.
+
+`DOCS_BASE` sets the path prefix of the docs. The default is `/docs`, and every path above starts with it. `SITE_ORIGIN` is the public origin of the docs and the detection website, `https://lm.ikale.io` by default, used for absolute URLs in the Open Graph tags of both and in the Markdown versions; set it to the deployment's own origin when you deploy elsewhere, such as Vercel, a Pages preview, or a fork. For local development, use `bun run dev:docs`. To build the docs alone, use `bun run --cwd docs build`.

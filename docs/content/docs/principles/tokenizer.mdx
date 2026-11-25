@@ -1,0 +1,124 @@
+---
+title: 分词器探测
+description: 用差分计数抵消隐藏内容，在 62 类开源分词器与“未收录”之间做贝叶斯开集判定，按成对误差上界挑选测试文本；结果作为参考信息显示在排名旁边，并与所填模型核对。
+icon: Binary
+---
+
+目标是用尽量少的短请求判断接口背后用的是哪一种分词器（模型把文字切成 token 的规则），作为参考信息显示在数字指纹的排名旁边，并与所填模型核对。数字指纹比较的是模型的输出偏好；分词器探测比较的是上游计算 token 的方式，它只需要接口在响应的用量（`usage`）中报告输入 token 数，与模型怎么回答无关。只要计数来自上游真实的分词器，上游改写回复也不影响结果。
+
+## 差分计数
+
+每个请求只含一条用户消息：固定前缀 $P$、测试文本 $t_j$、固定后缀 $S$。前缀是 `Reply with OK.\n<<<\n`，后缀是 `\n>>>`：前缀以非空白字符开头、后缀以非空白字符结尾，聊天模板裁掉首尾空白也不影响计数。对照请求只发 $P + S$。于是
+
+$$
+x_j - x_0 = \operatorname{count}(P\,t_j\,S) - \operatorname{count}(P\,S)
+$$
+
+聊天模板、注入的系统提示和特殊 token 这些隐藏内容在差值中抵消。不同协议读取不同的字段：Chat Completions 用 `prompt_tokens`，Responses 用 `input_tokens`，Messages 用 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`。流式响应从带用量的事件中读取：Chat Completions 请求会附带 `stream_options.include_usage`，Messages 读 `message_start` 与 `message_delta`，Responses 读 `response.completed`。后来的事件里值为 `null` 的字段不覆盖已读到的计数；读到协议的结束事件（`[DONE]`、`message_stop`、`response.completed` 或 `response.incomplete`）且已有用量时立即结束读取，不等上游关闭连接。
+
+## 分词器库
+
+分词器库 `data/tokenizer_bank.json` 由分词器归档工具 llm-tokenizer-fingerprint 离线生成，对每个开源分词器算出同一个差值：
+
+```mermaid
+flowchart LR
+    A["290 个开源分词器"] --> B["280 条候选文本<br/>逐一计算差值"]
+    B --> C["计数完全相同的<br/>归为一类"]
+    C --> D["同一谱系下只差<br/>少数文本的再合并"]
+    D --> E["62 类"]
+    E --> F["贪心挑选：尽量让每两类<br/>被 3 条测试文本区分"]
+    F --> G["72 条测试文本"]
+```
+
+同一谱系合并后，类内成员在个别测试文本上的不同计数保留为 `alternatives`，判定时任一取值都算吻合。72 条测试文本覆盖中日韩文字、印度诸文字、东南亚文字、西里尔、阿拉伯、希伯来、希腊、亚美尼亚与格鲁吉亚文字，以及拉丁文本、代码、空白、符号、emoji 和结构化文本。
+
+## 后验概率 [#posterior]
+
+后验概率指看完全部计数后，每种假设的可信程度。假设分三种：
+
+| 假设 | 先验 | 含义 |
+| --- | --- | --- |
+| 已收录的某一类 | 0.8 | 上游使用该类分词器，偏差只来自少见的测量误差 |
+| 与某类相近的未收录分词器 | 0.1 | 相当一部分测试文本的计数与该类不同 |
+| 与所有类都无关的分词器 | 0.1 | 每条测试文本的差值服从所有类的平滑分布 |
+
+窄的一段对应精确吻合，宽的一段吸收偶发的偏差，下限让一次异常最多扣除有限的证据。每条测试文本的残差 $r$（实测差值与该类最近的允许取值之差）服从带下限的两段离散拉普拉斯混合：
+
+$$
+\ell(r) = \log\bigl((1-\rho)\,g_{0.02}(r) + \rho\,g_{0.85}(r) + 10^{-6}\bigr), \qquad g_p(r) = \frac{1-p}{1+p}\,p^{\lvert r\rvert}
+$$
+
+污染率 $\rho$ 在一组取值上求边缘：已收录类取 0.02、0.06、0.15，相近分词器取 0.2、0.4、0.7。隐藏内容的长度在对照请求附近 ±3 个 token 的窗口上求边缘；对照请求本身直接观测隐藏内容，使用固定的污染率。
+
+## 挑选测试文本 [#selection]
+
+每一批挑选最能分开“还分不清的候选”的测试文本。每个候选类提供两个原子：“恰好是该类”，权重为该类的后验概率；“该类的未收录近亲”，权重为该近亲的后验概率。“与所有类都无关的分词器”是另一个原子。每一类自成一组，近亲与无关分词器同属“未收录”一组。准则是成对 Bhattacharyya 上界，只对不同组的原子对求和：
+
+$$
+F(S) = \sum_{\substack{a<b \\ g(a) \ne g(b)}} \sqrt{\tilde w_a \tilde w_b}\,\Bigl(1 - \prod_{j \in S} \mathrm{BC}_j(a, b)\Bigr), \qquad \tilde w_a = \frac{w_a}{\sum_c w_c}
+$$
+
+其中 $g(a)$ 是原子 $a$ 所在的组，$w$ 是原子的后验概率，$\tilde w$ 是它在参与规划的原子中归一化后的权重，$\mathrm{BC}_j(a,b)$ 是两个原子在测试文本 $j$ 上预测分布的 Bhattacharyya 系数，也就是两者预测的重叠程度，重叠越大，这条测试文本越分不开它们。第一个回答之前，所有类以相同权重参与，只用“恰好是该类”的原子；之后只取后验概率（恰好与近亲之和）最高的 24 类及无关分词器参与规划。这个量是 MAP 错误率（取概率最大的一组作结论时判错的概率）的上界，且单调次模，也就是每多选一条收益只会递减，所以逐条贪心挑选有保证：贪心批次不差于最优批次的 $1 - 1/e$；计数精确时，它退化为等价类边切割（EC²，把还分不清的类一对一对切开）。
+
+停止条件：
+
+- 至少回答了 4 条测试文本后，某一类或“未收录”的后验概率达到 99%；
+- 或者最佳批次对上界的改进小于 $10^{-4}$；
+- 或者达到测试文本上限（默认 20 条）。
+
+最后再发一次对照请求；两次计数不同说明上游加入了长度会变化的隐藏内容，结果会带上提示。
+
+## 判定与核对
+
+| 判定 | 条件 | 报告的概率 |
+| --- | --- | --- |
+| `exact` 完全一致 | 某一类的后验概率不低于“未收录”的总和 | 恰好是该类的概率 |
+| `related` 接近已收录的类 | 某类的相近分词器的后验概率不低于“无关分词器” | 是该类相近分词器的概率 |
+| `unknown` 未收录 | 其余情况 | 任一未收录分词器的概率 |
+
+所填模型名去掉供应商前缀和 `:` 后缀后，先按[厂商型号映射](#api-models)匹配，再按各类的别名匹配。按厂商型号映射匹配时，厂商公开的就是这一种分词器，核对的概率是上游恰好使用该类的后验概率，未收录的近亲不算吻合；按别名匹配的开源谱系可能有重新训练的变体，核对的概率是上游使用该类或其相近分词器的后验概率。映射为 `null` 的型号（厂商没有公开分词器）改用“未收录”的后验概率。概率不低于 0.9 为一致，不高于 0.1 为不一致，其余为还不能确定。映射和别名都不匹配的型号无法核对。
+
+## 与排名的关系 [#ranking]
+
+分词器结果只作参考信息：判定、候选分词器、请求记录和上面与所填模型的核对单独显示在排名旁边，不改变候选排名和置信度，检测结果也不等待探测完成。同一种分词器常被多个模型复用，中转站也可能在本地估算用量，所以计数只用来回答一个问题：上游的分词器与所填模型是否相符。
+
+## 评估 [#evaluation]
+
+在 62 类分词器上离线模拟上游（隐藏内容的长度随机，`eps05` 表示每条测试文本以 5% 的概率偏离 1–2 个 token，`eps15` 表示以 15% 的概率偏离 1–4 个 token）：
+
+| 设置 | 第一名正确 | 平均请求数 |
+| --- | --- | --- |
+| 逐个发送，无噪声 | 62 / 62 | 约 11 |
+| 逐个发送，`eps05` | 62 / 62 | 未统计 |
+| 逐个发送，`eps15` | 61 / 62 | 未统计 |
+| 同时 4 个，无噪声 | 62 / 62 | 约 13 |
+
+置信度在 0.9–1 区间的平均值为 0.987，实际正确率为 1.000。
+
+逐一把某一类从分词器库中移除、再用它的计数探测（留一类评估），有 8 / 62 次被判为另一个已收录的类。这些都是衍生或扩展关系的分词器对，例如 cl100k_base 与 StableLM 2、GPT-2 与 CodeGen、Llama 3 与千帆 VL、Llama 2 与 OpenHathi：扩展版本在测试文本上与原分词器几乎一致，只看计数无法区分。
+
+## 局限
+
+- 分词器一致只说明分词器相同。同一种分词器常被多个模型复用，例如小米 MiMo 与 MiniCPM-V 复用 Qwen2 到 Qwen3 的分词器。
+- 中转站若用 tiktoken 在本地估算用量，也会测成 o200k_base 或 cl100k_base。
+- 未收录但由已收录分词器扩展而来的分词器，可能被判为原分词器，见上面的留一类评估。
+- 上游不报告用量，或报告的计数经过修改时，无法探测。
+
+## 已收录的分词器 [#classes]
+
+<TokenizerClasses />
+
+## 厂商型号映射 [#api-models]
+
+<TokenizerClasses view="models" />
+
+## 参考文献
+
+- D. Golovin, A. Krause, D. Ray. [Near-Optimal Bayesian Active Learning with Noisy Observations](https://arxiv.org/abs/1010.3091). NIPS 2010. 等价类边切割（EC²）。
+- D. Golovin, A. Krause. [Adaptive Submodularity: Theory and Applications in Active Learning and Stochastic Optimization](https://arxiv.org/abs/1003.3967). JAIR 2011.
+- Y. Chen, A. Krause. [Near-optimal Batch Mode Active Learning and Adaptive Submodular Optimization](https://proceedings.mlr.press/v28/chen13b.html). ICML 2013. 贪心批次策略。
+- A. Krause, C. Guestrin. [Near-optimal Nonmyopic Value of Information in Graphical Models](https://arxiv.org/abs/1207.1394). UAI 2005. 信息增益的次模性与 $1-1/e$ 近似。
+- T. Kailath. [The Divergence and Bhattacharyya Distance Measures in Signal Selection](https://www.semanticscholar.org/paper/The-Divergence-and-Bhattacharyya-Distance-Measures-Kailath/b5b2ee1af1c0a867f564e44f3f79b8d2bdeca749). IEEE Trans. Commun. Technol., 1967. Bhattacharyya 距离与误判概率。
+- A. Ghosh, T. Roughgarden, M. Sundararajan. [Universally Utility-Maximizing Privacy Mechanisms](https://arxiv.org/abs/0811.2841). STOC 2009. 双侧几何（离散拉普拉斯）分布。
+- N. Brümmer. [Generative, Fully Bayesian, Gaussian, Openset Pattern Classifier](https://arxiv.org/abs/1307.6143). 2013. 开集贝叶斯判定。
+- D. Pasquini, E. Kornaropoulos, G. Ateniese. [LLMmap: Fingerprinting for Large Language Models](https://arxiv.org/abs/2407.15847). USENIX Security 2025. 相关的模型指纹工作。

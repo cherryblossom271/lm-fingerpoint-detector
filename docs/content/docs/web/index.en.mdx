@@ -1,0 +1,75 @@
+---
+title: Website
+description: The manual and API sampling modes, the switches in the API configuration, and how to read detection results.
+icon: Globe
+---
+
+The detection website [lm.ikale.io](https://lm.ikale.io) is a pure frontend app. Challenge generation, feature extraction, and ranking all run in the browser, and the reference bank is served as static files. The website only runs detection and browses the reference bank read-only. It never writes any reply to the reference bank. Your API key is sent only when a request goes out, to the API you enter or to a forwarding proxy, as the connection mode you choose decides; see [Connection](./connection.mdx).
+
+"New models", next to the detection page title, lists up to five models added to the library in the last 7 days, by the browser's clock. Each model shows how many days ago it was added; hover to see the date. Models from OpenAI, Anthropic, DeepSeek, Gemini, and GLM come first, and both groups list the most recently added first. The list is hidden when no model was added in that period. On narrow screens it moves below the title. Click a model name to open its library page. A model's added time is the time recorded on its earliest reference batch.
+
+## Sampling modes
+
+<Tabs items={['Manual', 'API']}>
+  <Tab value="Manual">
+    The page generates three challenges. Send each challenge to the target model separately (for example, in a new conversation in a chat interface), then paste each answer into its sample box. This mode suits the case where you have a chat interface but no API key. Prompts and replies are not translated, and switching the interface language does not change them.
+  </Tab>
+  <Tab value="API">
+    After you fill in the API configuration, the page sends requests upstream one at a time or in parallel with the selected protocol, and shows each reply as it is generated. Verification can start automatically after sampling finishes. Each sample is drawn on its own: while one sample is sampling, you can still start, stop, edit, or clear the others. Stop on a sample card ends only that sample; Stop in the action bar ends all of them.
+  </Tab>
+</Tabs>
+
+Before any reply is filled in, "New prompts" in the action bar replaces all three challenges at once. Once a reply is there, "Start over" replaces the challenges and clears the replies.
+
+## API configuration
+
+| Field | Description |
+| --- | --- |
+| Base URL | Base URL or complete endpoint. An address that ends in a protocol endpoint (such as `/chat/completions`) is used as it is, an address that ends in `/v1` gets the endpoint added, and any other address gets `/v1` and the endpoint added; for an API whose base path is not `/v1`, enter the complete endpoint |
+| Model | The model name in the request |
+| API key | Hidden by default. You can toggle it visible |
+| Reasoning effort | Can be left blank, or set to any `reasoning_effort` value that the upstream supports |
+| Protocol | Chat Completions, Responses, or Messages |
+| Service tier | Flex, Default, Fast, or Ultrafast. Default sends no parameter. Messages sends `speed` with the `anthropic-beta: fast-mode-2026-02-01` header; Chat Completions and Responses send `service_tier` |
+
+Switches below the configuration, all on by default except "Tokenizer probe" and "Image mode":
+
+- **Streaming**: uses SSE and shows output as it is generated. When off, the page waits for the complete JSON response.
+- **Parallel requests**: sends the three samples at once, and the tokenizer probe four requests at a time. When off, requests go one by one, which takes longer.
+- **Relaxed mode**: streaming sampling stops once it receives the requested count of complete valid integers. A non-streaming reply that exceeds the requested count keeps only the first N. The interface marks both cases as "Capped". When off, the upstream reply must finish naturally and completely.
+- **Verify automatically after sampling**: computes the result automatically once all three samples succeed and no other sample is still sampling.
+- **Tokenizer probe**: off by default. When on, it sends about 12 extra short requests while sampling (at most 22) and identifies the upstream tokenizer. The result is reference information and does not change the ranking. APIs billed per request bill these requests. See [Tokenizer probe](./tokenizer.mdx).
+- **Image mode**: off by default. When on, each prompt is sent as a PNG, and the only text in the request is a generic instruction drawn at random from several languages (such as “Follow the instructions in the image.”), so none of the prompt keywords appear. The width, font size, line spacing, margins, and shades change with every image. The model must accept image input. The reference bank was sampled with text prompts, so image mode results may deviate from text mode. The tokenizer probe still sends text.
+
+Below the switches is "Connection": Auto, Direct, This site's proxy (the default), or Own Worker. It decides whether the browser calls the API directly or sends requests through a proxy; see [Connection](./connection.mdx).
+
+The configuration and the key are saved automatically in the browser's localStorage and are restored after a reload or when you reopen the page. The profile menu supports several profiles, which you can rename, create, duplicate, and delete. "Save" only confirms the current configuration in the browser. "Export" and "Load" move a configuration between a file and the browser. An exported file contains your API key in plain text, so do not send it to anyone or upload it to cloud storage. "Connection" is a browser-level setting and does not belong to any profile.
+
+## Reading results [#reading-results]
+
+If all three answers are valid, the result area lists the candidates of the reference bank in ranking order, with one confidence value per row. The confidence is a relative probability within the reference bank: all candidates total 100%, and models outside the bank are not included. When the calibration does not match the detector, the page shows only the ranking, without confidence.
+
+The ranking and the confidence come from the number fingerprint alone. In API mode, the result of the [tokenizer probe](./tokenizer.mdx) appears separately as reference information in the fourth entry of the sample strip and in the tokenizer details. The result does not wait for the probe, which keeps running beside it.
+
+If the confidence of the top candidate is below 75%, the page shows a low-confidence warning. If only one or two answers are valid, the page shows only the ranking, without confidence.
+
+The detector withholds ranking and confidence when all three sequence measures exceed their limits. Replies with weak adjacent-pair signals can still be ranked if they rarely repeat similar values within three positions. See the [language-model reply check](../principles/ranking.mdx#sequence-check).
+
+If the smallest valid number of a sample is 200 or more, the page marks its distribution as abnormal and the result as unreliable. The prompt causes this distribution, so resampling with the same prompt repeats it. In API mode, "New prompt and resample" generates new challenges for these samples and samples them again at once with the original settings; in manual mode, "New prompt" only replaces the prompts and clears the matching answers. The other samples stay as they are. This warning plays no part in scoring.
+
+<Callout type="warn" title="A ranking is not proof of identity">
+  A model outside the bank still gets a "closest" candidate. A result with the same name as the claimed model is supporting evidence, but it cannot prove identity on its own. A result naming another model does not directly prove that the model was substituted, because the fingerprints of some models are naturally close. This site cannot reliably detect intermittent model substitution. See also the [disclaimer](../disclaimer.mdx).
+</Callout>
+
+## Export
+
+- **PNG image**: generated in a browser Canvas at twice the pixel density. It contains the site name, the date, the top candidate, the top five entries, the number of valid samples, and a note on the limitations, in the current language and theme. It does not contain the API key, the Base URL, the model ID you entered, or the reply text.
+- **JSON**: the candidate list and the confidence values; once the probe has ended, also the tokenizer probe report (the verdict, the check against the model you entered, and the count of every request). It contains neither the API address nor the API key.
+- **Library page**: browse reference replies by model, each with its original prompt. You can search, filter by family, and export to JSONL. Keys and authorization fields are removed before export.
+
+In the Simplified Chinese interface, the model detail pages for `openpangu-2.0-pro` and `openpangu-2.0-flash` omit the fingerprint similarity list.
+
+## Related pages
+
+- [Tokenizer probe](./tokenizer.mdx): how API detection identifies the upstream tokenizer, and how to read the result.
+- [Connection](./connection.mdx): where each of the four connection modes sends requests, and how Auto decides between a direct call and this site's proxy.

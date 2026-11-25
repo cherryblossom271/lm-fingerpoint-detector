@@ -1,0 +1,1 @@
+export const NORMAL_CONFIDENCE_THRESHOLD = 0.75

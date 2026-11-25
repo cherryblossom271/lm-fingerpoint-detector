@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/src/assets/branding/favicon.ico" sizes="16x16 32x32 48x48 64x64" />
+    <link rel="icon" type="image/png" href="/src/assets/branding/favicon.png" sizes="256x256" />
+    <link rel="apple-touch-icon" href="/src/assets/branding/apple-touch-icon.png" sizes="180x180" />
+    <title>Fingerpoint Detector</title>
+    <script>
+      (() => {
+        let theme = 'system';
+        try { theme = localStorage.getItem('fp-theme') || 'system'; } catch {}
+        const dark = theme === 'dark' || (theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.classList.toggle('dark', dark);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

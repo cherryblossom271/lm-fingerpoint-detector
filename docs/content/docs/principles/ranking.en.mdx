@@ -1,0 +1,61 @@
+---
+title: Ranking and calibration
+description: A frequency ranking and a position/order discriminant set the candidate order with equal weights, and a temperature softmax gives the confidence within the reference bank.
+icon: ListOrdered
+---
+
+## Language-model reply check [#sequence-check]
+
+Before ranking, the detector checks how consecutive numbers change. Language-model replies in the reference bank usually jump between distant values: lag-1 autocorrelation is clearly negative, and steps of 20 or less are rare. Program-generated random numbers, sorted numbers and shuffled replies usually lack both features.
+
+For each valid answer, the detector measures lag-1 autocorrelation and the share of adjacent pairs that differ by at most 20. Some model replies avoid similar values over several positions, so the detector also counts all pairs one, two or three positions apart and measures the share that differ by at most 20. Each pair counts once. The detector takes the median of each measure across valid answers. It withholds the ranking only if all three medians exceed their limits: −0.23, 5% and 7%, respectively. The first two limits come from the 99.5% quantiles over the reference bank’s three-answer groups.
+
+This check filters sequence shapes. It cannot prove where the numbers came from, and passing it does not confirm that a language model generated the reply.
+
+## Ranker
+
+The ranker calculates two scores for each model in the reference bank: the frequency ranking $f$ and the position/order discriminant $q$. It standardizes each score across the candidates and adds them with equal weights:
+
+$$
+s = 0.5\, z(f) + 0.5\, z(q), \qquad f = 0.5\, z_{\text{LDA}} + 0.25\, z_{\text{kNN}} + 0.25\, z_{\text{centroid}}
+$$
+
+The frequency ranking $f$ has three parts:
+
+- **LDA**: a linear discriminant projection of the features of the first 128 integers, averaged over the answers.
+- **Nearest neighbors**: the mean of the 7 smallest squared distances to the reference answers of the model, with the median over the answers.
+- **Nuisance-free centroids**: the prompt environment shifts the whole distribution of a model. When the bank is built, SVD estimates a nuisance subspace of at most 2 dimensions from the mean offsets of the environments. At scoring time, the ranker first projects out this subspace, then calculates the cosine similarity to each model centroid. The position-block features are also compared with the model templates of each environment.
+
+The position/order discriminant $q$ is an LDA with shrinkage 0.5. It uses four feature blocks with 751 dimensions in total:
+
+| Block | Dimensions | Weight | Content |
+| --- | ---: | ---: | --- |
+| Value distribution | 355 | 0.6 | The same Hellinger embedding as the frequency ranking |
+| Positions and final digits | 74 | 0.15 | The same block distribution as the frequency ranking |
+| Position kernel | 102 | 0.125 | 24 value RBFs and 10 final-digit indicators, each multiplied by 3 relative-position polynomials and averaged. It shows whether a type of number occurs more often at the start, middle, or end |
+| Sequence | 220 | 0.125 | Correlation, step size, and equality rates at 8 lags; transition matrices of 8 value bins and of final digits, with marginals removed; up/down persistence; bin coverage in short windows |
+
+Each block is standardized and normalized to unit length, then concatenated with its weight. The ranker standardizes the discriminant values of each answer across the candidates, then averages them over the answers.
+
+The ranking score $s$ sets the candidate order. The weights of the two scores and the shrinkage come from leave-one-environment-out cross-validation on the reference bank. The fixed evaluation set does not take part in this selection.
+
+## Confidence calibration [#calibration]
+
+The confidence is calculated only when all three answers are valid and the calibration in `data/shared_detector.bin` matches the detector. It is a temperature softmax within the reference bank:
+
+$$
+p_k = \frac{\exp(\tau s_k)}{\sum_j \exp(\tau s_j)}
+$$
+
+`fpd retrain` fits the temperature $\tau$ offline. It holds out each of the 12 environments, then each pair of environments, and refits the ranker 78 times. The held-out results give the estimate of $\tau$. The nested held-out binary NLL must be lower than a constant baseline, and the AUC must be greater than 0.75. Otherwise, retraining does not replace the current detector. $p_k$ is distributed only among the models in the reference bank: all candidates add up to 100%, and models outside the bank are not included. It is not the probability that the service really is that model. When the calibration does not match the detector, the result gives the ranking only, without confidence.
+
+## Reference bank and detector
+
+| File | Content |
+| --- | --- |
+| `data/unified_reference.jsonl` | Reference batches. Each line holds the model, channel, request parameters, and answers |
+| `data/unified_bank.json` | Statistics derived from the reference batches |
+| `data/shared_detector.bin` | Frozen ranker and calibration parameters (binary), bound to the reference data by SHA-256. The CLI and the website both decode it with `shared/detector-codec.ts` |
+| `data/enrollment-suite.json` | The 36 fixed sampling challenges |
+
+If the reference bank does not match the detector (for example, a custom bank from `--bank`), detection stops with an error; run `fpd retrain --data-dir DIR` first. See [Data files](../reference/data.mdx) for the format and change log of the data files.

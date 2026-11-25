@@ -1,0 +1,27 @@
+node_modules/
+.DS_Store
+dist/
+target/
+.venv/
+web/public/data/
+web/.generated/
+*.tsbuildinfo
+*.log
+.vercel/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+*.lock/
+data/.pending-enrollment/
+data/.enrollments/
+data/.training/
+runs/
+research/
+docs/build/
+docs/.react-router/
+docs/.source/
+# Python research tools can import historical product code.
+__pycache__/
+*.pyc
